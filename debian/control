@@ -1,0 +1,7 @@
+Package: frp
+Section: net
+Priority: optional
+Maintainer: coplo <dayearnew@gmail.com>
+Homepage: https://github.com/fatedier/frp
+Description: Fast reverse proxy for exposing local services
+ frpc and frps are packaged directly from the official upstream Linux release binaries.

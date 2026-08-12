@@ -1,0 +1,132 @@
+name: Package upstream release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      upstream_version: ${{ steps.upstream.outputs.upstream_version }}
+      version: ${{ steps.upstream.outputs.version }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/fatedier/frp/releases/latest --jq .tag_name)"
+          upstream_version="${tag#v}"
+          prefix="frp-${upstream_version}-"
+          latest_revision=0
+          latest_tag=""
+          while IFS= read -r candidate; do
+            revision=${candidate#"$prefix"}
+            if [[ "$candidate" == "$prefix"* && "$revision" =~ ^[0-9]+$ ]] && (( revision > latest_revision )); then
+              latest_revision=$revision
+              latest_tag=$candidate
+            fi
+          done < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')
+
+          if (( latest_revision == 0 )); then
+            revision=1
+            should_build=true
+          else
+            git fetch --tags --force
+            if git diff --quiet "$latest_tag"..HEAD -- debian/control package.sh .github/workflows/package.yml; then
+              revision=$latest_revision
+              should_build=false
+            else
+              revision=$((latest_revision + 1))
+              should_build=true
+            fi
+          fi
+          version="${upstream_version}-${revision}"
+          release_tag="frp-${version}"
+          {
+            echo "tag=${tag}"
+            echo "upstream_version=${upstream_version}"
+            echo "version=${version}"
+            echo "release_tag=${release_tag}"
+            echo "should_build=${should_build}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            upstream_arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            upstream_arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Debian package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./package.sh \
+            '${{ needs.resolve.outputs.tag }}' \
+            '${{ needs.resolve.outputs.upstream_version }}' \
+            '${{ needs.resolve.outputs.version }}' \
+            '${{ matrix.arch }}' \
+            '${{ matrix.upstream_arch }}'
+      - name: Validate installed package
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./dist/*.deb
+          test "$(dpkg --print-architecture)" = '${{ matrix.arch }}'
+          frpc --version
+          frps --version
+          test -f /etc/frp/frpc.toml
+          test -f /etc/frp/frps.toml
+          test -f /usr/lib/systemd/system/frpc.service
+          test -f /usr/lib/systemd/system/frps.service
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create '${{ needs.resolve.outputs.release_tag }}' dist/*.deb \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '${{ needs.resolve.outputs.release_tag }}' \
+            --notes 'Built from the official fatedier/frp Release binaries.'
